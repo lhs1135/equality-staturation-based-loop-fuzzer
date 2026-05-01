@@ -2,6 +2,7 @@ mod eqsat;
 mod exec;
 
 use rand::Rng;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
@@ -331,7 +332,168 @@ fn move_case_to(out_dir: &str, idx: usize, subdir: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Per-iteration outcome
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum IterOutcome {
+    Skipped,            // no valid back-edge found after retries
+    NoFusion,           // opt ran but fusion did not fire
+    OptError,           // opt itself failed
+    FusionHit,          // fusion fired; alive2 not configured
+    VerificationFailed, // alive2 rejected or errored
+    VerifiedNoExec,     // alive2 OK; clang not configured
+    ExecClean,          // alive2 OK + exec outputs match
+    ExecError,          // alive2 OK + exec infrastructure error
+    BugFound,           // alive2 OK + exec outputs differ
+}
+
+/// Run one fuzzing iteration identified by `done` (used as the file-name index).
+/// Each call gets its own thread-local RNG so threads are fully independent.
+/// Returns a single-line status string (for println!) alongside the outcome.
+fn run_iteration(
+    done: usize,
+    out_dir: &str,
+    llvm_stress: &str,
+    opt_path: Option<&str>,
+    alive_tv_path: Option<&str>,
+    clang_path: Option<&str>,
+) -> (IterOutcome, String) {
+    let mut rng = rand::thread_rng();
+
+    // Try up to 30 seeds to find one that admits a back-edge.
+    let (ir, modified, b_label, p_label) = {
+        let mut found = None;
+        for _ in 0..30 {
+            let seed: u32 = rng.gen();
+            let ir = match generate_ir(llvm_stress, seed) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Some((m, b, p)) = add_back_edge(&ir, &mut rng) {
+                found = Some((ir, m, b, p));
+                break;
+            }
+        }
+        match found {
+            None => return (IterOutcome::Skipped, format!("[{done:3}] skipped: no valid back-edge")),
+            Some(v) => v,
+        }
+    };
+
+    let orig_path = format!("{out_dir}/orig_{done:04}.ll");
+    let loop_path = format!("{out_dir}/loop_{done:04}.ll");
+    std::fs::write(&orig_path, &ir).expect("write failed");
+    std::fs::write(&loop_path, &modified).expect("write failed");
+
+    let prefix = format!("[{done:3}] back-edge {b_label} → {p_label}");
+
+    let Some(opt) = opt_path else {
+        return (IterOutcome::FusionHit, prefix);
+    };
+
+    let norm_path  = format!("{out_dir}/norm_{done:04}.ll");
+    let fused_path = format!("{out_dir}/fused_{done:04}.ll");
+    let diff_path  = format!("{out_dir}/diff_{done:04}.txt");
+
+    match run_opt_fusion(opt, &loop_path, &fused_path, &norm_path) {
+        Err(e) => {
+            let _ = std::fs::remove_file(&norm_path);
+            return (IterOutcome::OptError, format!("{prefix}  |  opt error: {e}"));
+        }
+        Ok(false) => {
+            let _ = std::fs::remove_file(&fused_path);
+            let _ = std::fs::remove_file(&norm_path);
+            let _ = std::fs::remove_file(&loop_path);
+            let _ = std::fs::remove_file(&orig_path);
+            return (IterOutcome::NoFusion, format!("{prefix}  |  fusion: no"));
+        }
+        Ok(true) => {}
+    }
+
+    let diff = unified_diff(&norm_path, &fused_path);
+    std::fs::write(&diff_path, &diff).expect("write diff failed");
+
+    let Some(alive_tv) = alive_tv_path else {
+        return (
+            IterOutcome::FusionHit,
+            format!("{prefix}  |  FUSION FIRED  →  {fused_path}  diff: {diff_path}"),
+        );
+    };
+
+    use eqsat::verify::{alive2_verify, VerifyResult};
+    let verify_path = format!("{out_dir}/verify_{done:04}.txt");
+    let (verify_result, raw) = alive2_verify(alive_tv, &norm_path, &fused_path);
+    std::fs::write(&verify_path, &raw).expect("write verify failed");
+
+    match verify_result {
+        VerifyResult::Rejected { reason } => {
+            move_case_to(out_dir, done, "verification_failed");
+            return (
+                IterOutcome::VerificationFailed,
+                format!("{prefix}  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/"),
+            );
+        }
+        VerifyResult::Error(e) => {
+            move_case_to(out_dir, done, "verification_failed");
+            return (
+                IterOutcome::VerificationFailed,
+                format!("{prefix}  |  alive2 error: {e}  →  {out_dir}/verification_failed/"),
+            );
+        }
+        VerifyResult::Verified => {}
+    }
+
+    let verified_prefix = format!("{prefix}  |  FUSION FIRED + VERIFIED");
+
+    let Some(clang) = clang_path else {
+        move_case_to(out_dir, done, "verified");
+        return (
+            IterOutcome::VerifiedNoExec,
+            format!("{verified_prefix}  →  {out_dir}/verified/"),
+        );
+    };
+
+    let norm_bin  = format!("{out_dir}/norm_{done:04}_bin");
+    let fused_bin = format!("{out_dir}/fused_{done:04}_bin");
+    let exec_path = format!("{out_dir}/exec_{done:04}.txt");
+
+    match exec::differential_test(clang, &norm_path, &fused_path, &norm_bin, &fused_bin) {
+        exec::ExecResult::Match => {
+            let _ = std::fs::remove_file(&norm_bin);
+            let _ = std::fs::remove_file(&fused_bin);
+            move_case_to(out_dir, done, "verified");
+            (
+                IterOutcome::ExecClean,
+                format!("{verified_prefix}  |  exec: match  →  {out_dir}/verified/"),
+            )
+        }
+        exec::ExecResult::Mismatch { norm_out, fused_out } => {
+            let content = format!(
+                "=== norm output ===\n{norm_out}\n\
+                 === fused output ===\n{fused_out}\n"
+            );
+            std::fs::write(&exec_path, &content).expect("write exec result failed");
+            move_case_to(out_dir, done, "buggy");
+            (
+                IterOutcome::BugFound,
+                format!("{verified_prefix}  |  BUG FOUND  →  {out_dir}/buggy/"),
+            )
+        }
+        exec::ExecResult::Error(e) => {
+            let _ = std::fs::remove_file(&norm_bin);
+            let _ = std::fs::remove_file(&fused_bin);
+            move_case_to(out_dir, done, "exec_failed");
+            (
+                IterOutcome::ExecError,
+                format!("{verified_prefix}  |  exec error: {e}  →  {out_dir}/exec_failed/"),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eqsat demo
 // ---------------------------------------------------------------------------
 
 fn run_eqsat_demo() {
@@ -366,6 +528,10 @@ fn run_eqsat_demo() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -404,12 +570,19 @@ PIPELINE:
   Each stage is skipped when its tool argument is absent.
   Binaries and exec results are kept only when outputs differ (potential bug).
 
+PARALLELISM:
+  Iterations run in parallel across all available CPU threads.
+  Use RAYON_NUM_THREADS=N to cap concurrency.
+
 EXAMPLES:
   # Generate 10 pairs (IR only):
   eqsat-loop-fuzz
 
   # Full pipeline — 200 iterations:
   eqsat-loop-fuzz 200 out llvm-stress opt ~/alive2/build/alive-tv clang
+
+  # Full pipeline — 200 iterations, 8 threads:
+  RAYON_NUM_THREADS=8 eqsat-loop-fuzz 200 out llvm-stress opt ~/alive2/build/alive-tv clang
 
   # Run the equality saturation demo:
   eqsat-loop-fuzz --eqsat-demo
@@ -430,12 +603,9 @@ EXAMPLES:
         .get(3)
         .cloned()
         .unwrap_or_else(|| "llvm-stress".to_string());
-    // opt path is optional; if absent, loop-fusion step is skipped.
-    let opt_path = args.get(4).cloned();
-    // alive-tv path is optional; if present, every fusion candidate is verified.
-    let alive_tv_path = args.get(5).cloned();
-    // clang path is optional; enables differential execution testing after alive2.
-    let clang_path = args.get(6).cloned();
+    let opt_path       = args.get(4).cloned();
+    let alive_tv_path  = args.get(5).cloned();
+    let clang_path     = args.get(6).cloned();
 
     std::fs::create_dir_all(&out_dir).expect("Failed to create output directory");
 
@@ -452,162 +622,69 @@ EXAMPLES:
         eprintln!("Note: differential execution enabled — binaries kept only for buggy cases.");
     }
 
-    let mut rng = rand::thread_rng();
-    let mut done = 0;
-    let mut attempts = 0;
-    let mut fusion_hits: Vec<usize>        = Vec::new();
-    let mut verification_failed: Vec<usize> = Vec::new();
-    let mut exec_failed: Vec<usize>         = Vec::new();
-    let mut verified_clean: Vec<usize>      = Vec::new();
-    let mut exec_bugs: Vec<usize>           = Vec::new();
-    let max_attempts = iterations * 30;
-
+    let threads = rayon::current_num_threads();
     println!(
-        "Generating {} loop IR file pairs into '{out_dir}/' ...",
+        "Generating {} loop IR file pairs into '{out_dir}/'  (threads: {threads}) ...",
         iterations
     );
 
-    while done < iterations && attempts < max_attempts {
-        attempts += 1;
+    // Run all iterations in parallel; each thread owns its RNG.
+    let mut outcomes: Vec<(usize, IterOutcome)> = (0..iterations)
+        .into_par_iter()
+        .map(|done| {
+            let (outcome, msg) = run_iteration(
+                done,
+                &out_dir,
+                &llvm_stress,
+                opt_path.as_deref(),
+                alive_tv_path.as_deref(),
+                clang_path.as_deref(),
+            );
+            println!("{msg}");
+            (done, outcome)
+        })
+        .collect();
 
-        let seed: u32 = rng.gen();
-        let ir = match generate_ir(&llvm_stress, seed) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Fatal: {e}");
-                break;
+    // Sort by index so the summary is ordered.
+    outcomes.sort_by_key(|(i, _)| *i);
+
+    // Categorise outcomes for the summary.
+    let mut fusion_hits:         Vec<usize> = Vec::new();
+    let mut verification_failed: Vec<usize> = Vec::new();
+    let mut exec_failed:         Vec<usize> = Vec::new();
+    let mut verified_clean:      Vec<usize> = Vec::new();
+    let mut exec_bugs:           Vec<usize> = Vec::new();
+    let mut skipped = 0usize;
+
+    for (done, outcome) in &outcomes {
+        match outcome {
+            IterOutcome::Skipped                         => skipped += 1,
+            IterOutcome::NoFusion | IterOutcome::OptError => {}
+            IterOutcome::FusionHit                       => fusion_hits.push(*done),
+            IterOutcome::VerificationFailed              => verification_failed.push(*done),
+            IterOutcome::VerifiedNoExec | IterOutcome::ExecClean => {
+                fusion_hits.push(*done);
+                verified_clean.push(*done);
             }
-        };
-
-        let (modified, b_label, p_label) = match add_back_edge(&ir, &mut rng) {
-            None => continue,
-            Some(v) => v,
-        };
-
-        let orig_path = format!("{out_dir}/orig_{done:04}.ll");
-        let loop_path = format!("{out_dir}/loop_{done:04}.ll");
-
-        std::fs::write(&orig_path, &ir).expect("write failed");
-        std::fs::write(&loop_path, &modified).expect("write failed");
-
-        print!("[{done:3}] back-edge {b_label} → {p_label}");
-
-        // Req 4: apply loop fusion and diff.
-        if let Some(ref opt) = opt_path {
-            let fused_path = format!("{out_dir}/fused_{done:04}.ll");
-            let diff_path = format!("{out_dir}/diff_{done:04}.txt");
-
-            let norm_path = format!("{out_dir}/norm_{done:04}.ll");
-            match run_opt_fusion(opt, &loop_path, &fused_path, &norm_path) {
-                Err(e) => {
-                    let _ = std::fs::remove_file(&norm_path);
-                    println!("  |  opt error: {e}");
-                }
-                Ok(false) => {
-                    // Fusion did not fire; keep norm for inspection, remove identical fused.
-                    let _ = std::fs::remove_file(&fused_path);
-                    let _ = std::fs::remove_file(&norm_path);
-                    let _ = std::fs::remove_file(&loop_path);
-                    let _ = std::fs::remove_file(&orig_path);
-
-                    println!("  |  fusion: no");
-                }
-                Ok(true) => {
-                    let diff = unified_diff(&norm_path, &fused_path);
-                    std::fs::write(&diff_path, &diff).expect("write diff failed");
-
-                    match &alive_tv_path {
-                        None => {
-                            // No alive2 — keep files flat in out_dir.
-                            fusion_hits.push(done);
-                            println!("  |  FUSION FIRED  →  {fused_path}  diff: {diff_path}");
-                        }
-                        Some(alive_tv) => {
-                            use eqsat::verify::{alive2_verify, VerifyResult};
-                            let verify_path = format!("{out_dir}/verify_{done:04}.txt");
-                            let (result, raw) = alive2_verify(alive_tv, &norm_path, &fused_path);
-                            std::fs::write(&verify_path, &raw).expect("write verify failed");
-
-                            match result {
-                                VerifyResult::Verified => {
-                                    fusion_hits.push(done);
-                                    print!("  |  FUSION FIRED + VERIFIED");
-
-                                    if let Some(ref clang) = clang_path {
-                                        let norm_bin  = format!("{out_dir}/norm_{done:04}_bin");
-                                        let fused_bin = format!("{out_dir}/fused_{done:04}_bin");
-                                        let exec_path = format!("{out_dir}/exec_{done:04}.txt");
-
-                                        match exec::differential_test(
-                                            clang, &norm_path, &fused_path,
-                                            &norm_bin, &fused_bin,
-                                        ) {
-                                            exec::ExecResult::Match => {
-                                                let _ = std::fs::remove_file(&norm_bin);
-                                                let _ = std::fs::remove_file(&fused_bin);
-                                                verified_clean.push(done);
-                                                move_case_to(&out_dir, done, "verified");
-                                                println!("  |  exec: match  →  {out_dir}/verified/");
-                                            }
-                                            exec::ExecResult::Mismatch { norm_out, fused_out } => {
-                                                let content = format!(
-                                                    "=== norm output ===\n{norm_out}\n\
-                                                     === fused output ===\n{fused_out}\n"
-                                                );
-                                                std::fs::write(&exec_path, &content)
-                                                    .expect("write exec result failed");
-                                                exec_bugs.push(done);
-                                                move_case_to(&out_dir, done, "buggy");
-                                                println!("  |  BUG FOUND  →  {out_dir}/buggy/");
-                                            }
-                                            exec::ExecResult::Error(e) => {
-                                                let _ = std::fs::remove_file(&norm_bin);
-                                                let _ = std::fs::remove_file(&fused_bin);
-                                                exec_failed.push(done);
-                                                move_case_to(&out_dir, done, "exec_failed");
-                                                println!("  |  exec error: {e}  →  {out_dir}/exec_failed/");
-                                            }
-                                        }
-                                    } else {
-                                        // No clang — alive2-verified cases go to verified/.
-                                        verified_clean.push(done);
-                                        move_case_to(&out_dir, done, "verified");
-                                        println!("  →  {out_dir}/verified/");
-                                    }
-                                }
-                                VerifyResult::Rejected { reason } => {
-                                    verification_failed.push(done);
-                                    move_case_to(&out_dir, done, "verification_failed");
-                                    println!(
-                                        "  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/"
-                                    );
-                                }
-                                VerifyResult::Error(e) => {
-                                    verification_failed.push(done);
-                                    move_case_to(&out_dir, done, "verification_failed");
-                                    println!(
-                                        "  |  alive2 error: {e}  →  {out_dir}/verification_failed/"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            IterOutcome::ExecError => {
+                fusion_hits.push(*done);
+                exec_failed.push(*done);
             }
-        } else {
-            println!();
+            IterOutcome::BugFound => {
+                fusion_hits.push(*done);
+                exec_bugs.push(*done);
+            }
         }
-
-        done += 1;
     }
 
-    if done < iterations {
-        eprintln!("Warning: only {done}/{iterations} files generated ({attempts} attempts).");
+    let done_count = iterations - skipped;
+    if skipped > 0 {
+        eprintln!("Warning: {skipped}/{iterations} iterations skipped (no valid back-edge found).");
     }
 
     if opt_path.is_some() {
         println!("\n=== eqsat-loop-fuzz summary ===");
-        println!("Iterations : {done}");
+        println!("Iterations : {done_count}");
         println!("Fusion hits: {}", fusion_hits.len());
         println!();
 
@@ -654,6 +731,6 @@ EXAMPLES:
             }
         }
     } else {
-        println!("\nDone: {done} file pairs in '{out_dir}/'.");
+        println!("\nDone: {done_count} file pairs in '{out_dir}/'.");
     }
 }
