@@ -303,6 +303,34 @@ fn unified_diff(a_path: &str, b_path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Output organisation
+// ---------------------------------------------------------------------------
+
+/// Move all files belonging to case `idx` from `out_dir` into `out_dir/subdir/`.
+/// Files that do not exist (e.g. bins already deleted) are silently skipped.
+fn move_case_to(out_dir: &str, idx: usize, subdir: &str) {
+    let target = format!("{out_dir}/{subdir}");
+    std::fs::create_dir_all(&target).unwrap_or(());
+    let candidates = [
+        format!("orig_{idx:04}.ll"),
+        format!("loop_{idx:04}.ll"),
+        format!("norm_{idx:04}.ll"),
+        format!("fused_{idx:04}.ll"),
+        format!("diff_{idx:04}.txt"),
+        format!("verify_{idx:04}.txt"),
+        format!("norm_{idx:04}_bin"),
+        format!("fused_{idx:04}_bin"),
+        format!("exec_{idx:04}.txt"),
+    ];
+    for name in &candidates {
+        let _ = std::fs::rename(
+            format!("{out_dir}/{name}"),
+            format!("{target}/{name}"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -427,8 +455,11 @@ EXAMPLES:
     let mut rng = rand::thread_rng();
     let mut done = 0;
     let mut attempts = 0;
-    let mut fusion_hits: Vec<usize> = Vec::new();
-    let mut exec_bugs: Vec<usize> = Vec::new();
+    let mut fusion_hits: Vec<usize>        = Vec::new();
+    let mut verification_failed: Vec<usize> = Vec::new();
+    let mut exec_failed: Vec<usize>         = Vec::new();
+    let mut verified_clean: Vec<usize>      = Vec::new();
+    let mut exec_bugs: Vec<usize>           = Vec::new();
     let max_attempts = iterations * 30;
 
     println!(
@@ -482,12 +513,12 @@ EXAMPLES:
                     println!("  |  fusion: no");
                 }
                 Ok(true) => {
-                    // Diff is between the normalized baseline and the fused IR.
                     let diff = unified_diff(&norm_path, &fused_path);
                     std::fs::write(&diff_path, &diff).expect("write diff failed");
 
                     match &alive_tv_path {
                         None => {
+                            // No alive2 — keep files flat in out_dir.
                             fusion_hits.push(done);
                             println!("  |  FUSION FIRED  →  {fused_path}  diff: {diff_path}");
                         }
@@ -496,14 +527,12 @@ EXAMPLES:
                             let verify_path = format!("{out_dir}/verify_{done:04}.txt");
                             let (result, raw) = alive2_verify(alive_tv, &norm_path, &fused_path);
                             std::fs::write(&verify_path, &raw).expect("write verify failed");
+
                             match result {
                                 VerifyResult::Verified => {
                                     fusion_hits.push(done);
-                                    print!(
-                                        "  |  FUSION FIRED + VERIFIED  →  {fused_path}  verify: {verify_path}"
-                                    );
+                                    print!("  |  FUSION FIRED + VERIFIED");
 
-                                    // Differential execution (requires clang).
                                     if let Some(ref clang) = clang_path {
                                         let norm_bin  = format!("{out_dir}/norm_{done:04}_bin");
                                         let fused_bin = format!("{out_dir}/fused_{done:04}_bin");
@@ -516,36 +545,48 @@ EXAMPLES:
                                             exec::ExecResult::Match => {
                                                 let _ = std::fs::remove_file(&norm_bin);
                                                 let _ = std::fs::remove_file(&fused_bin);
-                                                println!("  |  exec: match");
+                                                verified_clean.push(done);
+                                                move_case_to(&out_dir, done, "verified");
+                                                println!("  |  exec: match  →  {out_dir}/verified/");
                                             }
                                             exec::ExecResult::Mismatch { norm_out, fused_out } => {
                                                 let content = format!(
                                                     "=== norm output ===\n{norm_out}\n\
                                                      === fused output ===\n{fused_out}\n"
                                                 );
-                                                std::fs::write(&exec_path, content)
+                                                std::fs::write(&exec_path, &content)
                                                     .expect("write exec result failed");
                                                 exec_bugs.push(done);
-                                                println!("  |  BUG FOUND  exec: {exec_path}");
+                                                move_case_to(&out_dir, done, "buggy");
+                                                println!("  |  BUG FOUND  →  {out_dir}/buggy/");
                                             }
                                             exec::ExecResult::Error(e) => {
                                                 let _ = std::fs::remove_file(&norm_bin);
                                                 let _ = std::fs::remove_file(&fused_bin);
-                                                println!("  |  exec error: {e}");
+                                                exec_failed.push(done);
+                                                move_case_to(&out_dir, done, "exec_failed");
+                                                println!("  |  exec error: {e}  →  {out_dir}/exec_failed/");
                                             }
                                         }
                                     } else {
-                                        println!();
+                                        // No clang — alive2-verified cases go to verified/.
+                                        verified_clean.push(done);
+                                        move_case_to(&out_dir, done, "verified");
+                                        println!("  →  {out_dir}/verified/");
                                     }
                                 }
                                 VerifyResult::Rejected { reason } => {
+                                    verification_failed.push(done);
+                                    move_case_to(&out_dir, done, "verification_failed");
                                     println!(
-                                        "  |  FUSION FIRED but alive2 rejected: {reason}  verify: {verify_path}"
+                                        "  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/"
                                     );
                                 }
                                 VerifyResult::Error(e) => {
+                                    verification_failed.push(done);
+                                    move_case_to(&out_dir, done, "verification_failed");
                                     println!(
-                                        "  |  FUSION FIRED but alive2 error: {e}  verify: {verify_path}"
+                                        "  |  alive2 error: {e}  →  {out_dir}/verification_failed/"
                                     );
                                 }
                             }
@@ -565,34 +606,52 @@ EXAMPLES:
     }
 
     if opt_path.is_some() {
-        println!("\n=== Loop-fusion summary ===");
-        println!(
-            "Iterations: {done}  |  Fusion fired+verified: {}  |  Exec bugs: {}",
-            fusion_hits.len(),
-            exec_bugs.len(),
-        );
+        println!("\n=== eqsat-loop-fuzz summary ===");
+        println!("Iterations : {done}");
+        println!("Fusion hits: {}", fusion_hits.len());
+        println!();
 
-        if !exec_bugs.is_empty() {
-            println!("\nBUGS (outputs differed after fusion):");
-            for idx in &exec_bugs {
-                println!(
-                    "  iter {idx:04}  norm: {out_dir}/norm_{idx:04}_bin  \
-                     fused: {out_dir}/fused_{idx:04}_bin  \
-                     result: {out_dir}/exec_{idx:04}.txt"
-                );
+        if alive_tv_path.is_some() {
+            println!(
+                "Verification failed : {}  →  {out_dir}/verification_failed/",
+                verification_failed.len()
+            );
+            for idx in &verification_failed {
+                println!("  iter {idx:04}  verify: {out_dir}/verification_failed/verify_{idx:04}.txt");
             }
-        }
 
-        if !fusion_hits.is_empty() {
-            println!("\nFusion hits (all verified):");
-            for idx in &fusion_hits {
+            if clang_path.is_some() {
+                println!();
                 println!(
-                    "  iter {idx:04}  →  {out_dir}/norm_{idx:04}.ll  \
-                     {out_dir}/fused_{idx:04}.ll  {out_dir}/diff_{idx:04}.txt"
+                    "Exec failed         : {}  →  {out_dir}/exec_failed/",
+                    exec_failed.len()
                 );
+                for idx in &exec_failed {
+                    println!("  iter {idx:04}  norm: {out_dir}/exec_failed/norm_{idx:04}.ll");
+                }
+
+                println!();
+                println!(
+                    "Verified (clean)    : {}  →  {out_dir}/verified/",
+                    verified_clean.len()
+                );
+                for idx in &verified_clean {
+                    println!("  iter {idx:04}  fused: {out_dir}/verified/fused_{idx:04}.ll");
+                }
+
+                println!();
+                println!(
+                    "Bugs found          : {}  →  {out_dir}/buggy/",
+                    exec_bugs.len()
+                );
+                for idx in &exec_bugs {
+                    println!(
+                        "  iter {idx:04}  result: {out_dir}/buggy/exec_{idx:04}.txt  \
+                         norm_bin: {out_dir}/buggy/norm_{idx:04}_bin  \
+                         fused_bin: {out_dir}/buggy/fused_{idx:04}_bin"
+                    );
+                }
             }
-        } else {
-            println!("No verified fusion events detected in this run.");
         }
     } else {
         println!("\nDone: {done} file pairs in '{out_dir}/'.");
