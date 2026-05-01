@@ -350,7 +350,7 @@ enum IterOutcome {
 
 /// Run one fuzzing iteration identified by `done` (used as the file-name index).
 /// Each call gets its own thread-local RNG so threads are fully independent.
-/// Returns a single-line status string (for println!) alongside the outcome.
+/// Returns an optional log line: None means nothing noteworthy happened (no fusion).
 fn run_iteration(
     done: usize,
     out_dir: &str,
@@ -358,7 +358,7 @@ fn run_iteration(
     opt_path: Option<&str>,
     alive_tv_path: Option<&str>,
     clang_path: Option<&str>,
-) -> (IterOutcome, String) {
+) -> (IterOutcome, Option<String>) {
     let mut rng = rand::thread_rng();
 
     // Try up to 30 seeds to find one that admits a back-edge.
@@ -376,7 +376,7 @@ fn run_iteration(
             }
         }
         match found {
-            None => return (IterOutcome::Skipped, format!("[{done:3}] skipped: no valid back-edge")),
+            None => return (IterOutcome::Skipped, None),
             Some(v) => v,
         }
     };
@@ -389,7 +389,7 @@ fn run_iteration(
     let prefix = format!("[{done:3}] back-edge {b_label} → {p_label}");
 
     let Some(opt) = opt_path else {
-        return (IterOutcome::FusionHit, prefix);
+        return (IterOutcome::FusionHit, Some(prefix));
     };
 
     let norm_path  = format!("{out_dir}/norm_{done:04}.ll");
@@ -399,14 +399,14 @@ fn run_iteration(
     match run_opt_fusion(opt, &loop_path, &fused_path, &norm_path) {
         Err(e) => {
             let _ = std::fs::remove_file(&norm_path);
-            return (IterOutcome::OptError, format!("{prefix}  |  opt error: {e}"));
+            return (IterOutcome::OptError, Some(format!("{prefix}  |  opt error: {e}")));
         }
         Ok(false) => {
             let _ = std::fs::remove_file(&fused_path);
             let _ = std::fs::remove_file(&norm_path);
             let _ = std::fs::remove_file(&loop_path);
             let _ = std::fs::remove_file(&orig_path);
-            return (IterOutcome::NoFusion, format!("{prefix}  |  fusion: no"));
+            return (IterOutcome::NoFusion, None);
         }
         Ok(true) => {}
     }
@@ -417,7 +417,7 @@ fn run_iteration(
     let Some(alive_tv) = alive_tv_path else {
         return (
             IterOutcome::FusionHit,
-            format!("{prefix}  |  FUSION FIRED  →  {fused_path}  diff: {diff_path}"),
+            Some(format!("{prefix}  |  FUSION FIRED  →  {fused_path}  diff: {diff_path}")),
         );
     };
 
@@ -431,14 +431,14 @@ fn run_iteration(
             move_case_to(out_dir, done, "verification_failed");
             return (
                 IterOutcome::VerificationFailed,
-                format!("{prefix}  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/"),
+                Some(format!("{prefix}  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/")),
             );
         }
         VerifyResult::Error(e) => {
             move_case_to(out_dir, done, "verification_failed");
             return (
                 IterOutcome::VerificationFailed,
-                format!("{prefix}  |  alive2 error: {e}  →  {out_dir}/verification_failed/"),
+                Some(format!("{prefix}  |  alive2 error: {e}  →  {out_dir}/verification_failed/")),
             );
         }
         VerifyResult::Verified => {}
@@ -450,7 +450,7 @@ fn run_iteration(
         move_case_to(out_dir, done, "verified");
         return (
             IterOutcome::VerifiedNoExec,
-            format!("{verified_prefix}  →  {out_dir}/verified/"),
+            Some(format!("{verified_prefix}  →  {out_dir}/verified/")),
         );
     };
 
@@ -465,7 +465,7 @@ fn run_iteration(
             move_case_to(out_dir, done, "verified");
             (
                 IterOutcome::ExecClean,
-                format!("{verified_prefix}  |  exec: match  →  {out_dir}/verified/"),
+                Some(format!("{verified_prefix}  |  exec: match  →  {out_dir}/verified/")),
             )
         }
         exec::ExecResult::Mismatch { norm_out, fused_out } => {
@@ -477,7 +477,7 @@ fn run_iteration(
             move_case_to(out_dir, done, "buggy");
             (
                 IterOutcome::BugFound,
-                format!("{verified_prefix}  |  BUG FOUND  →  {out_dir}/buggy/"),
+                Some(format!("{verified_prefix}  |  BUG FOUND  →  {out_dir}/buggy/")),
             )
         }
         exec::ExecResult::Error(e) => {
@@ -486,7 +486,7 @@ fn run_iteration(
             move_case_to(out_dir, done, "exec_failed");
             (
                 IterOutcome::ExecError,
-                format!("{verified_prefix}  |  exec error: {e}  →  {out_dir}/exec_failed/"),
+                Some(format!("{verified_prefix}  |  exec error: {e}  →  {out_dir}/exec_failed/")),
             )
         }
     }
@@ -640,7 +640,9 @@ EXAMPLES:
                 alive_tv_path.as_deref(),
                 clang_path.as_deref(),
             );
-            println!("{msg}");
+            if let Some(line) = msg {
+                println!("{line}");
+            }
             (done, outcome)
         })
         .collect();
