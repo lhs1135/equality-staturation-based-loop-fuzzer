@@ -4,7 +4,7 @@ pub mod rules;
 pub mod runner;
 pub mod verify;
 
-pub use extractor::{extract_best, extract_worst, extract_smallest};
+pub use extractor::{extract_best, extract_worst};
 pub use language::LoopIR;
 pub use runner::EqsatResult;
 
