@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
+use eqsat::verify::{alive2_verify, VerifyResult};
 
 #[derive(Debug, Clone)]
 struct Block {
@@ -145,6 +146,37 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
 // Back-edge insertion
 // ---------------------------------------------------------------------------
 
+/// Inject a back-edge (B → P) into `lines` in-place.
+///
+/// `b`  — the latch block (its unconditional branch becomes conditional).
+/// `p`  — the header block (gains a `[ undef, %B ]` arm on every existing phi).
+/// `shift` — number of lines already inserted before `b`'s terminator line
+///           (used to adjust the stored line index when two edges are added).
+///
+/// Returns the exit block label (the false-branch target of the new branch).
+fn inject_back_edge(
+    lines: &mut Vec<String>,
+    b: &Block,
+    p: &Block,
+    shift: usize,
+) -> String {
+    // Update P's phi nodes.
+    for &phi in &p.phi_lines {
+        let adj = phi + shift;
+        lines[adj] = format!("{}, [ undef, %{} ]", lines[adj].trim_end(), b.label);
+    }
+
+    // Replace B's unconditional branch with a conditional one.
+    let exit = b.successors[0].clone();
+    let t = b.terminator_line + shift;
+    let indent: String = lines[t].chars().take_while(|c| c.is_whitespace()).collect();
+    let cond = format!("backedge_{}", b.terminator_line); // stable name across shifts
+    lines[t] = format!("{}br i1 %{}, label %{}, label %{}", indent, cond, p.label, exit);
+    lines.insert(t, format!("{}%{} = freeze i1 poison", indent, cond));
+
+    exit
+}
+
 /// Add a random back-edge B → P to create a CFG cycle (loop).
 ///
 /// Strategy
@@ -161,138 +193,120 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
 ///
 /// If no suitable block exists in this IR, returns None — caller should skip
 /// and try the next llvm-stress output.
+/// Collect valid (latch_idx, header_idx) back-edge candidates from `blocks`.
+fn back_edge_candidates(
+    blocks: &[Block],
+    pred_map: &HashMap<String, Vec<String>>,
+    entry: &str,
+) -> Vec<(usize, usize)> {
+    blocks.iter().enumerate()
+        .filter(|(_, b)| b.terminator_line != usize::MAX && b.successors.len() == 1)
+        .flat_map(|(bi, b)| {
+            pred_map.get(&b.label).into_iter().flatten()
+                .filter(|p| p.as_str() != entry && *p != &b.label)
+                .filter_map(|p| blocks.iter().position(|bl| &bl.label == p))
+                .map(move |pi| (bi, pi))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
 fn add_back_edge(ir: &str, rng: &mut impl Rng) -> Option<(String, String, String)> {
     let original_lines: Vec<&str> = ir.lines().collect();
     let blocks = parse_blocks(&original_lines);
+    if blocks.len() < 2 { return None; }
 
-    if blocks.len() < 2 {
-        return None;
-    }
-
-    // pred_map[X] = all blocks that directly branch to X
     let mut pred_map: HashMap<String, Vec<String>> = HashMap::new();
     for b in &blocks {
-        for succ in &b.successors {
-            pred_map.entry(succ.clone()).or_default().push(b.label.clone());
-        }
+        for s in &b.successors { pred_map.entry(s.clone()).or_default().push(b.label.clone()); }
     }
 
-    let entry_label = &blocks[0].label;
+    let candidates = back_edge_candidates(&blocks, &pred_map, &blocks[0].label);
+    if candidates.is_empty() { return None; }
 
-    // Candidates: B has exactly 1 successor (unconditional branch only),
-    // and a direct predecessor P that is not the entry block and not B itself.
-    let mut candidates: Vec<(&Block, String)> = Vec::new();
+    let (bi, pi) = candidates[rng.gen_range(0..candidates.len())];
+    let (b, p) = (&blocks[bi], &blocks[pi]);
+    let mut lines: Vec<String> = original_lines.iter().map(|l| l.to_string()).collect();
+    inject_back_edge(&mut lines, b, p, 0);
+
+    Some((lines.join("\n"), b.label.clone(), p.label.clone()))
+}
+
+/// Add two back-edges to create two adjacent, non-nested loops.
+///
+/// Loop 1: P1 → … → B1 → P1.  Loop 2 starts at or after loop 1's exit block,
+/// guaranteeing the two loops are adjacent rather than nested.
+///
+/// Returns (modified_ir, b1, p1, b2, p2) or None if the IR lacks enough structure.
+fn add_two_back_edges(
+    ir: &str,
+    rng: &mut impl Rng,
+) -> Option<(String, String, String, String, String)> {
+    let original_lines: Vec<&str> = ir.lines().collect();
+    let blocks = parse_blocks(&original_lines);
+    if blocks.len() < 4 { return None; }
+
+    let mut pred_map: HashMap<String, Vec<String>> = HashMap::new();
     for b in &blocks {
-        if b.terminator_line == usize::MAX || b.successors.len() != 1 {
-            continue;
-        }
-        let Some(preds) = pred_map.get(&b.label) else {
-            continue;
-        };
-        for p in preds {
-            if p != entry_label && p != &b.label {
-                candidates.push((b, p.clone()));
-            }
-        }
+        for s in &b.successors { pred_map.entry(s.clone()).or_default().push(b.label.clone()); }
     }
+    let entry = blocks[0].label.clone();
 
-    if candidates.is_empty() {
-        return None;
-    }
+    let all_cands = back_edge_candidates(&blocks, &pred_map, &entry);
+    if all_cands.len() < 2 { return None; }
 
-    let (b_block, p_label) = &candidates[rng.gen_range(0..candidates.len())];
-    let p_block = blocks.iter().find(|bl| &bl.label == p_label)?;
+    // First back-edge.
+    let (b1i, p1i) = all_cands[rng.gen_range(0..all_cands.len())];
+    let (b1, p1) = (&blocks[b1i], &blocks[p1i]);
+    let exit1 = &b1.successors[0];
 
-    let mut new_lines: Vec<String> = original_lines.iter().map(|l| l.to_string()).collect();
+    // Source-order position of loop 1's exit — second loop must start here or later.
+    let exit1_pos = blocks.iter().position(|b| &b.label == exit1)?;
 
-    // 1. Add B's PHI arm to P (undef is valid for a new back-edge).
-    for &phi_idx in &p_block.phi_lines {
-        let existing = new_lines[phi_idx].trim_end().to_string();
-        new_lines[phi_idx] = format!("{}, [ undef, %{} ]", existing, b_block.label);
-    }
-
-    // 2. Replace B's unconditional branch with a conditional one.
-    //    Insert the freeze condition just before the (now-replaced) terminator.
-    let term_idx = b_block.terminator_line;
-    let indent: String = new_lines[term_idx]
-        .chars()
-        .take_while(|c| c.is_whitespace())
+    // Second candidates: both latch and header at or after exit1_pos, distinct from first.
+    let second_cands: Vec<(usize, usize)> = all_cands.iter()
+        .filter(|&&(bi, pi)| bi >= exit1_pos && pi >= exit1_pos && bi != b1i && pi != p1i)
+        .copied()
         .collect();
-    let cond_var = format!("backedge_{}", term_idx);
-    let orig_succ = b_block.successors[0].clone();
+    if second_cands.is_empty() { return None; }
 
-    new_lines[term_idx] = format!(
-        "{}br i1 %{}, label %{}, label %{}",
-        indent, cond_var, p_label, orig_succ
-    );
-    new_lines.insert(
-        term_idx,
-        format!("{}%{} = freeze i1 poison", indent, cond_var),
-    );
+    let (b2i, p2i) = second_cands[rng.gen_range(0..second_cands.len())];
+    let (b2, p2) = (&blocks[b2i], &blocks[p2i]);
 
-    Some((new_lines.join("\n"), b_block.label.clone(), p_label.clone()))
+    let mut lines: Vec<String> = original_lines.iter().map(|l| l.to_string()).collect();
+
+    // Inject first back-edge (shift = 0).
+    inject_back_edge(&mut lines, b1, p1, 0);
+
+    // Inject second back-edge; the first injection inserted one line before b1's
+    // terminator, so every index ≥ b1.terminator_line shifts by 1.
+    let shift2 = if b2.terminator_line >= b1.terminator_line { 1 } else { 0 };
+    inject_back_edge(&mut lines, b2, p2, shift2);
+
+    Some((
+        lines.join("\n"),
+        b1.label.clone(), p1.label.clone(),
+        b2.label.clone(), p2.label.clone(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Loop fusion via opt
 // ---------------------------------------------------------------------------
 
-/// Strip LLVM IR comments (`;` to end-of-line) so that cosmetic changes like
-/// `; preds = ...` reorderings do not count as semantic differences.
-fn strip_comments(ir: &str) -> String {
-    ir.lines()
-        .map(|line| {
-            if let Some(pos) = line.find(';') {
-                line[..pos].trim_end().to_string()
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Run opt in two stages to isolate loop-fusion changes from preprocessing.
-///
-/// Stage 1: loop-simplify + lcssa  →  normalized form required by loop-fusion.
-/// Stage 2: loop-fusion only       →  `output_path` (the fused IR).
-///
-/// Returns Ok(true) only when loop-fusion itself made a semantic change
-/// (comments such as `; preds = …` reorderings are ignored).
-///
-/// Also writes the stage-1 normalized IR to `norm_path` for reference.
-fn run_opt_fusion(
-    opt: &str,
-    input_path: &str,
-    output_path: &str,
-    norm_path: &str,
-) -> Result<bool, String> {
-    // Stage 1: normalize into LCSSA / loop-simplified form.
-    let s1 = Command::new(opt)
-        .args(["-passes=loop-simplify,lcssa", "-S", input_path, "-o", norm_path])
+/// Normalize IR with mem2reg, loop-simplify, and lcssa.
+/// Writes the canonical form to `output_path`.
+fn normalize_ir(opt: &str, input_path: &str, output_path: &str) -> Result<(), String> {
+    let status = Command::new(opt)
+        .args(["-passes=mem2reg,loop-simplify,lcssa", "-S", input_path, "-o", output_path])
         .status()
         .map_err(|e| format!("Cannot run '{}': {}", opt, e))?;
-    if !s1.success() {
-        return Err(format!("opt (normalize) exited with: {}", s1));
+    if !status.success() {
+        Err(format!("opt (normalize) exited with: {}", status))
+    } else {
+        Ok(())
     }
-
-    // Stage 2: loop-fusion only, starting from the normalized IR.
-    let s2 = Command::new(opt)
-        .args(["-passes=loop-fusion", "-S", norm_path, "-o", output_path])
-        .status()
-        .map_err(|e| format!("Cannot run '{}': {}", opt, e))?;
-    if !s2.success() {
-        return Err(format!("opt (loop-fusion) exited with: {}", s2));
-    }
-
-    // Compare stripping comments so that "; preds = ..." reorderings are ignored.
-    let before = std::fs::read_to_string(norm_path)
-        .map(|s| strip_comments(&s))
-        .unwrap_or_default();
-    let after = std::fs::read_to_string(output_path)
-        .map(|s| strip_comments(&s))
-        .unwrap_or_default();
-    Ok(before != after)
 }
 
 /// Return the unified diff of two files using the system `diff` command.
@@ -361,8 +375,8 @@ fn run_iteration(
 ) -> (IterOutcome, Option<String>) {
     let mut rng = rand::thread_rng();
 
-    // Try up to 30 seeds to find one that admits a back-edge.
-    let (ir, modified, b_label, p_label) = {
+    // Try up to 30 seeds to find an IR that admits two adjacent back-edges.
+    let (ir, modified, b1_label, p1_label, b2_label, p2_label) = {
         let mut found = None;
         for _ in 0..30 {
             let seed: u32 = rng.gen();
@@ -370,8 +384,8 @@ fn run_iteration(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Some((m, b, p)) = add_back_edge(&ir, &mut rng) {
-                found = Some((ir, m, b, p));
+            if let Some(v) = add_two_back_edges(&ir, &mut rng) {
+                found = Some((ir, v.0, v.1, v.2, v.3, v.4));
                 break;
             }
         }
@@ -386,7 +400,7 @@ fn run_iteration(
     std::fs::write(&orig_path, &ir).expect("write failed");
     std::fs::write(&loop_path, &modified).expect("write failed");
 
-    let prefix = format!("[{done:3}] back-edge {b_label} → {p_label}");
+    let prefix = format!("[{done:3}] loops {p1_label}→{b1_label} / {p2_label}→{b2_label}");
 
     let Some(opt) = opt_path else {
         return (IterOutcome::FusionHit, Some(prefix));
@@ -396,20 +410,67 @@ fn run_iteration(
     let fused_path = format!("{out_dir}/fused_{done:04}.ll");
     let diff_path  = format!("{out_dir}/diff_{done:04}.txt");
 
-    match run_opt_fusion(opt, &loop_path, &fused_path, &norm_path) {
+    // Normalize: mem2reg + loop-simplify + lcssa.
+    if let Err(e) = normalize_ir(opt, &loop_path, &norm_path) {
+        let _ = std::fs::remove_file(&norm_path);
+        return (IterOutcome::OptError, Some(format!("{prefix}  |  opt error: {e}")));
+    }
+
+    // eqsat: norm IR → LoopIR → run fusion rule → extract best form.
+    let norm_ir = match std::fs::read_to_string(&norm_path) {
+        Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_file(&norm_path);
-            return (IterOutcome::OptError, Some(format!("{prefix}  |  opt error: {e}")));
+            return (IterOutcome::OptError, Some(format!("{prefix}  |  read norm IR: {e}")));
         }
-        Ok(false) => {
-            let _ = std::fs::remove_file(&fused_path);
+    };
+
+    let loop1_expr = eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p1_label, &b1_label);
+    let loop2_expr = eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p2_label, &b2_label);
+
+    let seq_str = match (loop1_expr, loop2_expr) {
+        (Some(e1), Some(e2)) => format!("(seq {} {})", e1, e2),
+        _ => {
             let _ = std::fs::remove_file(&norm_path);
             let _ = std::fs::remove_file(&loop_path);
             let _ = std::fs::remove_file(&orig_path);
             return (IterOutcome::NoFusion, None);
         }
-        Ok(true) => {}
+    };
+
+    let input_expr = match seq_str.parse::<egg::RecExpr<eqsat::language::LoopIR>>() {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = std::fs::remove_file(&norm_path);
+            let _ = std::fs::remove_file(&loop_path);
+            let _ = std::fs::remove_file(&orig_path);
+            return (IterOutcome::OptError, Some(format!("{prefix}  |  eqsat parse: {e}")));
+        }
+    };
+
+    let result = eqsat::runner::EqsatResult::run(&input_expr);
+    let root   = result.roots[0];
+    let (_, best) = eqsat::extractor::extract_best(&result.egraph, root);
+    let best_str = best.to_string();
+
+    // Fusion fired when the best form is a Loop, not a Seq.
+    let fusion_fired = best_str.trim_start().starts_with("(loop ");
+
+    if !fusion_fired {
+        let _ = std::fs::remove_file(&norm_path);
+        let _ = std::fs::remove_file(&loop_path);
+        let _ = std::fs::remove_file(&orig_path);
+        return (IterOutcome::NoFusion, None);
     }
+
+    // TODO step 7: convert best_str back to LLVM IR and write fused_path.
+    // Until then, log the eqsat result and return FusionHit.
+    return (
+        IterOutcome::FusionHit,
+        Some(format!("{prefix}  |  eqsat fusion fired  →  {best_str}")),
+    );
+
+    #[allow(unreachable_code)]
 
     let diff = unified_diff(&norm_path, &fused_path);
     std::fs::write(&diff_path, &diff).expect("write diff failed");
@@ -421,7 +482,6 @@ fn run_iteration(
         );
     };
 
-    use eqsat::verify::{alive2_verify, VerifyResult};
     let verify_path = format!("{out_dir}/verify_{done:04}.txt");
     let (verify_result, raw) = alive2_verify(alive_tv, &norm_path, &fused_path);
     std::fs::write(&verify_path, &raw).expect("write verify failed");
@@ -493,43 +553,6 @@ fn run_iteration(
 }
 
 // ---------------------------------------------------------------------------
-// Eqsat demo
-// ---------------------------------------------------------------------------
-
-fn run_eqsat_demo() {
-    println!("=== Equality Saturation Demo (egg) ===\n");
-
-    let examples: &[(&str, &str)] = &[
-        // LICM: hoist invariant head/tail out of the loop so adjacent loops
-        // are exposed for LLVM's loop-fusion pass.
-        ("licm hoist head",  "(loop 0 100 1 (seq K body))"),
-        ("licm hoist tail",  "(loop 0 100 1 (seq body K))"),
-        // After LICM the two loops become adjacent — LLVM can then fuse them.
-        (
-            "licm exposes adjacent loops",
-            "(seq (loop 0 N 1 (seq body1 K)) \
-                  (loop 0 N 1 (seq K body2)))",
-        ),
-        ("add-zero simplification", "(+ x 0)"),
-        ("mul-one simplification",  "(* y 1)"),
-        ("sub-self simplification", "(- z z)"),
-        ("seq-nop elimination",     "(seq nop (+ i 1))"),
-        ("dead loop elimination",   "(loop 0 10 1 nop)"),
-    ];
-
-    for (name, expr) in examples {
-        let best  = eqsat::optimize(expr);
-        let worst = eqsat::optimize_worst(expr);
-        match (best, worst) {
-            (Ok((bc, br)), Ok((wc, wr))) =>
-                println!("[{name}]\n  in   : {expr}\n  best : {br}  (cost {bc})\n  worst: {wr}  (cost {wc})\n"),
-            (Err(e), _) | (_, Err(e)) =>
-                println!("[{name}] ERROR: {e}\n"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -546,27 +569,26 @@ ARGUMENTS (all positional, all optional):
   1  <iters>       Number of loop IR pairs to generate           [default: 10]
   2  <out_dir>     Output directory for all generated files      [default: out]
   3  <llvm-stress> Path to the llvm-stress binary                [default: llvm-stress]
-  4  <opt>         Path to opt; enables loop-fusion step         [default: skip]
+  4  <opt>         Path to opt; enables normalization step       [default: skip]
   5  <alive-tv>    Path to alive-tv; enables alive2 verification [default: skip]
   6  <clang>       Path to clang; enables differential execution [default: skip]
 
 FLAGS:
-  --eqsat-demo    Run the equality saturation demo and exit
   -h, --help      Print this help message and exit
 
 OUTPUT FILES (written to <out_dir>/):
   orig_NNNN.ll       Raw llvm-stress output
-  loop_NNNN.ll       IR with a synthetic back-edge inserted
-  norm_NNNN.ll       Loop-simplified / LCSSA-normalised IR  (requires <opt>)
-  fused_NNNN.ll      Loop-fused IR                          (requires <opt>, fusion fired)
-  diff_NNNN.txt      Unified diff of norm vs fused          (requires <opt>, fusion fired)
-  verify_NNNN.txt    alive-tv stdout+stderr                 (requires <alive-tv>, fusion fired)
-  norm_NNNN_bin      Compiled norm binary — kept only on bug (requires <clang>)
-  fused_NNNN_bin     Compiled fused binary — kept only on bug (requires <clang>)
-  exec_NNNN.txt      Both execution outputs — created only on bug (requires <clang>)
+  loop_NNNN.ll       IR with two synthetic back-edges inserted
+  norm_NNNN.ll       mem2reg / loop-simplify / LCSSA-normalised IR  (requires <opt>)
+  fused_NNNN.ll      eqsat-fused IR                                 (requires <opt>, fusion fired)
+  diff_NNNN.txt      Unified diff of norm vs fused                  (requires <opt>, fusion fired)
+  verify_NNNN.txt    alive-tv stdout+stderr                         (requires <alive-tv>, fusion fired)
+  norm_NNNN_bin      Compiled norm binary — kept only on bug        (requires <clang>)
+  fused_NNNN_bin     Compiled fused binary — kept only on bug       (requires <clang>)
+  exec_NNNN.txt      Both execution outputs — created only on bug   (requires <clang>)
 
 PIPELINE:
-  generate IR → add back-edge → loop-fusion (opt) → alive2 verify → diff exec (clang)
+  generate IR → add two back-edges → normalize (opt) → eqsat fusion → alive2 verify → diff exec (clang)
   Each stage is skipped when its tool argument is absent.
   Binaries and exec results are kept only when outputs differ (potential bug).
 
@@ -583,15 +605,8 @@ EXAMPLES:
 
   # Full pipeline — 200 iterations, 8 threads:
   RAYON_NUM_THREADS=8 eqsat-loop-fuzz 200 out llvm-stress opt ~/alive2/build/alive-tv clang
-
-  # Run the equality saturation demo:
-  eqsat-loop-fuzz --eqsat-demo
 "
             );
-            return;
-        }
-        Some("--eqsat-demo") => {
-            run_eqsat_demo();
             return;
         }
         _ => {}
