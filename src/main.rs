@@ -425,18 +425,26 @@ fn run_iteration(
         }
     };
 
-    let loop1_expr = eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p1_label, &b1_label);
-    let loop2_expr = eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p2_label, &b2_label);
-
-    let seq_str = match (loop1_expr, loop2_expr) {
-        (Some(e1), Some(e2)) => format!("(seq {} {})", e1, e2),
-        _ => {
+    let (loop1_expr, meta1) = match eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p1_label, &b1_label) {
+        Some(v) => v,
+        None => {
             let _ = std::fs::remove_file(&norm_path);
             let _ = std::fs::remove_file(&loop_path);
             let _ = std::fs::remove_file(&orig_path);
             return (IterOutcome::NoFusion, None);
         }
     };
+    let (loop2_expr, meta2) = match eqsat::llvm_to_eqsat::ir_to_loopir(&norm_ir, &p2_label, &b2_label) {
+        Some(v) => v,
+        None => {
+            let _ = std::fs::remove_file(&norm_path);
+            let _ = std::fs::remove_file(&loop_path);
+            let _ = std::fs::remove_file(&orig_path);
+            return (IterOutcome::NoFusion, None);
+        }
+    };
+
+    let seq_str = format!("(seq {} {})", loop1_expr, loop2_expr);
 
     let input_expr = match seq_str.parse::<egg::RecExpr<eqsat::language::LoopIR>>() {
         Ok(e) => e,
@@ -463,14 +471,16 @@ fn run_iteration(
         return (IterOutcome::NoFusion, None);
     }
 
-    // TODO step 7: convert best_str back to LLVM IR and write fused_path.
-    // Until then, log the eqsat result and return FusionHit.
-    return (
-        IterOutcome::FusionHit,
-        Some(format!("{prefix}  |  eqsat fusion fired  →  {best_str}")),
+    // Step 7: back-convert fused LoopIR to LLVM IR.
+    // All data was collected from norm_ir during the ir_to_loopir calls above.
+    let (preamble, epilogue) = eqsat::llvm_to_eqsat::extract_preamble_epilogue(
+        &norm_ir, &p1_label, &meta2.exit,
     );
-
-    #[allow(unreachable_code)]
+    let fused_ir = match eqsat::llvm_to_eqsat::loopir_to_llvm(&meta1, &meta2, &preamble, &epilogue) {
+        Some(s) => s,
+        None => return (IterOutcome::OptError, Some(format!("{prefix}  |  back-conversion failed"))),
+    };
+    std::fs::write(&fused_path, &fused_ir).expect("write fused IR failed");
 
     let diff = unified_diff(&norm_path, &fused_path);
     std::fs::write(&diff_path, &diff).expect("write diff failed");
