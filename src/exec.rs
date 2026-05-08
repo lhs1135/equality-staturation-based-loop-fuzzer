@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 const BUF_SIZE: usize = 4096;
-const EXEC_TIMEOUT_SECS: u64 = 10;
+const EXEC_TIMEOUT_MS: u64 = 100;
 
 // llvm-stress always generates this fixed signature:
 //   void @autogen_SD<seed>(ptr, ptr, ptr, i32, i64, i8)
@@ -130,9 +130,9 @@ fn run_with_timeout(exe: &str) -> Result<String, String> {
     thread::spawn(move || {
         let _ = tx.send(Command::new(&exe_owned).output());
     });
-    match rx.recv_timeout(Duration::from_secs(EXEC_TIMEOUT_SECS)) {
+    match rx.recv_timeout(Duration::from_millis(EXEC_TIMEOUT_MS)) {
         Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
         Ok(Err(e)) => Err(format!("exec error: {e}")),
-        Err(_) => Err(format!("timed out after {EXEC_TIMEOUT_SECS}s")),
+        Err(_) => Err(format!("timed out after {}ms", EXEC_TIMEOUT_MS)),
     }
 }

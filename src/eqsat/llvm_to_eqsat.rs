@@ -395,10 +395,8 @@ fn build_loopir(header: &str, preheader: &str, latch: &str, exit: &str, phis: &[
     for phi in phis {
         let id_var  = expr.add(LoopIR::Symbol(phi.var.as_str().into()));
         let id_init = val_id(&mut expr, &phi.init);
-        let id_ipre = expr.add(LoopIR::Symbol(preheader.into()));
         let id_step = val_id(&mut expr, &phi.step);
-        let id_slat = expr.add(LoopIR::Symbol(latch.into()));
-        phi_ids.push(expr.add(LoopIR::Phi([id_var, id_init, id_ipre, id_step, id_slat])));
+        phi_ids.push(expr.add(LoopIR::Phi([id_var, id_init, id_step])));
     }
     let id_phis = expr.add(LoopIR::Phis(phi_ids.into_boxed_slice()));
 

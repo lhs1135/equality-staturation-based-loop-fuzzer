@@ -4,11 +4,12 @@ use egg::*;
 define_language! {
     pub enum LoopIR {
         // Arithmetic
-        "loop" = Loop([Id; 6]),      // (loop header preheader latch exit phis body)
-        "phis" = Phis(Box<[Id]>),
-        "phi"  = Phi([Id; 5]),       // (phi var init init_pred step step_pred)
+        "loop"        = Loop([Id; 6]),         // (loop header preheader latch exit phis body)
+        "phis"        = Phis(Box<[Id]>),
+        "phi"         = Phi([Id; 3]),          // (phi var init step) — preds implicit from enclosing loop
+        "merged-phis" = MergedPhis([Id; 2]),   // (merged-phis phis1 phis2)
 
-        "seq"  = Seq([Id; 2]),       // (seq loop1 loop2)
+        "seq"         = Seq([Id; 2]),          // (seq loop1 loop2)
 
         "body"        = Body(Id),
         "fused-body"  = FusedBody([Id; 2]),

@@ -17,7 +17,7 @@ pub fn make_rules() -> Vec<Rewrite<LoopIR, ()>> {
                (loop ?h1 ?pre1 ?lat1 ?mid  ?phis1 ?body1)
                (loop ?h2 ?mid  ?lat2 ?exit ?phis2 ?body2))"
             =>
-            "(loop ?h1 ?pre1 ?lat2 ?exit ?phis1 (fused-body ?body1 ?body2))"
+            "(loop ?h1 ?pre1 ?lat2 ?exit (merged-phis ?phis1 ?phis2) (fused-body ?body1 ?body2))"
         ),
     ]
 }

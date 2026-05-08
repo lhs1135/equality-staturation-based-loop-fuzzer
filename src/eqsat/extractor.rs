@@ -17,10 +17,11 @@ where
         enode.children().iter().fold(base, |acc, &id| acc.saturating_add(costs(id)))
     };
     match enode {
-        LoopIR::Loop(_)      => sum_children(100),
-        LoopIR::Seq(_)       => sum_children(5),
-        LoopIR::FusedBody(_) => sum_children(3),
-        _                    => sum_children(1),
+        LoopIR::Loop(_)       => sum_children(100),
+        LoopIR::Seq(_)        => sum_children(5),
+        LoopIR::FusedBody(_)  => sum_children(3),
+        LoopIR::MergedPhis(_) => sum_children(1),
+        _                     => sum_children(1),
     }
 }
 
