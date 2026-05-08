@@ -299,7 +299,8 @@ fn add_two_back_edges(
 /// Writes the canonical form to `output_path`.
 fn normalize_ir(opt: &str, input_path: &str, output_path: &str) -> Result<(), String> {
     let status = Command::new(opt)
-        .args(["-passes=mem2reg,loop-simplify,lcssa", "-S", input_path, "-o", output_path])
+        // .args(["-passes=mem2reg,loop-simplify,lcssa", "-S", input_path, "-o", output_path])
+        .args(["-passes=loop-simplify,lcssa", "-S", input_path, "-o", output_path])
         .status()
         .map_err(|e| format!("Cannot run '{}': {}", opt, e))?;
     if !status.success() {
@@ -497,19 +498,29 @@ fn run_iteration(
     std::fs::write(&verify_path, &raw).expect("write verify failed");
 
     match verify_result {
-        VerifyResult::Rejected { reason } => {
-            move_case_to(out_dir, done, "verification_failed");
-            return (
-                IterOutcome::VerificationFailed,
-                Some(format!("{prefix}  |  alive2 rejected: {reason}  →  {out_dir}/verification_failed/")),
-            );
+        VerifyResult::Rejected { reason: _ } => {
+            // move_case_to(out_dir, done, "verification_failed");
+            // TEMP: clean up verification-failed cases instead of keeping them.
+            // To re-enable collection, remove the removals below and uncomment move_case_to above.
+            let _ = std::fs::remove_file(&orig_path);
+            let _ = std::fs::remove_file(&loop_path);
+            let _ = std::fs::remove_file(&norm_path);
+            let _ = std::fs::remove_file(&fused_path);
+            let _ = std::fs::remove_file(&diff_path);
+            let _ = std::fs::remove_file(&verify_path);
+            return (IterOutcome::VerificationFailed, None);
         }
-        VerifyResult::Error(e) => {
-            move_case_to(out_dir, done, "verification_failed");
-            return (
-                IterOutcome::VerificationFailed,
-                Some(format!("{prefix}  |  alive2 error: {e}  →  {out_dir}/verification_failed/")),
-            );
+        VerifyResult::Error(_) => {
+            // move_case_to(out_dir, done, "verification_failed");
+            // TEMP: clean up verification-failed cases instead of keeping them.
+            // To re-enable collection, remove the removals below and uncomment move_case_to above.
+            let _ = std::fs::remove_file(&orig_path);
+            let _ = std::fs::remove_file(&loop_path);
+            let _ = std::fs::remove_file(&norm_path);
+            let _ = std::fs::remove_file(&fused_path);
+            let _ = std::fs::remove_file(&diff_path);
+            let _ = std::fs::remove_file(&verify_path);
+            return (IterOutcome::VerificationFailed, None);
         }
         VerifyResult::Verified => {}
     }
@@ -716,13 +727,13 @@ EXAMPLES:
         println!();
 
         if alive_tv_path.is_some() {
-            println!(
-                "Verification failed : {}  →  {out_dir}/verification_failed/",
-                verification_failed.len()
-            );
-            for idx in &verification_failed {
-                println!("  iter {idx:04}  verify: {out_dir}/verification_failed/verify_{idx:04}.txt");
-            }
+            // println!(
+            //     "Verification failed : {}  →  {out_dir}/verification_failed/",
+            //     verification_failed.len()
+            // );
+            // for idx in &verification_failed {
+            //     println!("  iter {idx:04}  verify: {out_dir}/verification_failed/verify_{idx:04}.txt");
+            // }
 
             if clang_path.is_some() {
                 println!();
