@@ -543,10 +543,10 @@ fn run_iteration(
         exec::ExecResult::Match => {
             let _ = std::fs::remove_file(&norm_bin);
             let _ = std::fs::remove_file(&fused_bin);
-            move_case_to(out_dir, done, "verified");
+            move_case_to(out_dir, done, "exec_succ");
             (
                 IterOutcome::ExecClean,
-                Some(format!("{verified_prefix}  |  exec: match  →  {out_dir}/verified/")),
+                Some(format!("{verified_prefix}  |  exec: match  →  {out_dir}/exec_succ/")),
             )
         }
         exec::ExecResult::Mismatch { norm_out, fused_out } => {
@@ -747,11 +747,11 @@ EXAMPLES:
 
                 println!();
                 println!(
-                    "Verified (clean)    : {}  →  {out_dir}/verified/",
+                    "Exec success        : {}  →  {out_dir}/exec_succ/",
                     verified_clean.len()
                 );
                 for idx in &verified_clean {
-                    println!("  iter {idx:04}  fused: {out_dir}/verified/fused_{idx:04}.ll");
+                    println!("  iter {idx:04}  fused: {out_dir}/exec_succ/fused_{idx:04}.ll");
                 }
 
                 println!();
